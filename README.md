@@ -1,4 +1,4 @@
-# umnlookup
+# umnlookup [![Release](http://github-release-version.herokuapp.com/github/acmumn/umnlookup/release.svg)](https://github.com/acmumn/umnlookup/releases)
 
 Command-line program to look up people from the UMN student
 directory.
