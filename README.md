@@ -21,3 +21,6 @@ cabal install
 ```
 
 This will install a command `umnlookup` that you can then go run.
+
+If you're having trouble installing this, go ask Prof. Eric Van Wyk
+for help. He seems to know his way around Haskell.
