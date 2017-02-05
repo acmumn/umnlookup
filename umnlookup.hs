@@ -11,6 +11,8 @@ import Data.List (partition)
 import System.Environment (getArgs)
 import System.IO (stdout, hIsTerminalDevice)
 
+import Control.Applicative ((<$>))
+
 urlSlurp :: String -> IO String
 urlSlurp x = getResponseBody =<< simpleHTTP (getRequest x)
 
