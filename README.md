@@ -1,4 +1,4 @@
-# umnlookup [![Release](http://github-release-version.herokuapp.com/github/acmumn/umnlookup/release.svg)](https://github.com/acmumn/umnlookup/releases) [![Build Status](https://travis-ci.org/acmumn/umnlookup.svg?branch=master)](https://travis-ci.org/acmumn/umnlookup)
+# umnlookup [![Release](http://github-release-version.herokuapp.com/github/acmumn/umnlookup/release.svg)](https://github.com/acmumn/umnlookup/releases) [![License](https://img.shields.io/badge/license-BSD--3-ff69b4.svg)](https://github.com/acmumn/umnlookup/blob/master/LICENSE) [![Build Status](https://travis-ci.org/acmumn/umnlookup.svg?branch=master)](https://travis-ci.org/acmumn/umnlookup)
 
 Command-line program to look up people from the UMN student
 directory.
