@@ -57,7 +57,7 @@ executable umnlookup
   -- other-extensions:    
   
   -- Other library packages from which modules are imported.
-  build-depends:       base >=4.8 && <4.9
+  build-depends:       base
                      , HTTP
                      , tagsoup
                      , scalpel >=0.3 && <0.4

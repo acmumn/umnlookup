@@ -1,7 +1,6 @@
 language: haskell
 
 install:
-  - cabal install base-4.8.2.0
   - cabal install http
   - cabal install tagsoup
   - cabal install scalpel-0.3.1
