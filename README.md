@@ -5,17 +5,11 @@ Command-line program to look up people from the UMN student directory.
 ## Installation
 
 Install [Haskell](https://www.haskell.org/)
-and [Cabal](https://www.haskell.org/cabal/). Use Cabal to install the
-following packages:
+and [Cabal](https://www.haskell.org/cabal/). Then clone this repo and
+run the following commands from the repo directory:
 
 ```bash
-cabal install tagsoup http scalpel-0.3.1
-```
-
-Then clone this repo and run the following commands from the repo
-directory:
-
-```bash
+cabal install --only-dependencies
 cabal configure
 cabal install
 ```
