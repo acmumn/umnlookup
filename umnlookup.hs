@@ -1,206 +1,298 @@
-import Network.HTTP (simpleHTTP, getRequest, getResponseBody)
-import Network.HTTP.Base (urlEncodeVars)
-import Text.HTML.TagSoup (Tag, parseTags, (~==), canonicalizeTags, isTagCloseName)
-import Text.HTML.Scalpel (scrape, chroot, chroots, text, texts, (@:), (@=))
+{-# LANGUAGE OverloadedStrings #-}
+
+import Options.Applicative
+
+import Network.HTTP
+
+import Data.String.Utils (strip, replace)
+import Data.List (intersperse, partition)
+import Data.Semigroup ((<>))
+
 import Text.Printf (printf)
 
-import Data.Text (dropAround, pack, unpack)
-import Data.Char (isSpace, isControl, isPunctuation)
-import Data.List (partition)
+import System.Console.Terminal.Size
+import System.IO
 
-import System.Environment (getArgs)
-import System.IO (stdout, hIsTerminalDevice)
+import Text.HTML.Onama
+import Text.Parsec (parse, try, many1, ParsecT)
+import Text.Regex (subRegex, mkRegex)
 
-import Control.Applicative ((<$>))
+main :: IO ()
+main = execParser opts >>= lookupPeople
+  where lookupPeople lookup = do
+          tags <-     (drop 4)
+                  <$> (dropWhile notFormClose)
+                  <$> parseTags
+                  <$> urlSlurp (lookupURL lookup)
+          case parse umnLookup "" tags of
+            Left error -> hPutStrLn stderr (show error)
+            Right (Left error) -> hPutStrLn stderr error
+            Right (Right people) -> stdoutIO
+                                      (printPeopleTTY people)
+                                      (printPeopleNoTTY people)
+        notFormClose (TagClose "form" _) = False
+        notFormClose _other              = True
 
 urlSlurp :: String -> IO String
 urlSlurp x = getResponseBody =<< simpleHTTP (getRequest x)
 
-mix :: (b -> b -> b) -> (a -> b) -> (a -> b) -> a -> b
-mix combine f g = \x -> f x `combine` g x
+
+-- Parsing our command-line options.
 
-(<&&>) :: (a -> Bool) -> (a -> Bool) -> (a -> Bool)
-(<&&>) = mix (&&)
-infixl 8 <&&>
+opts :: ParserInfo Lookup
+opts = info (helper <*> lookupCLI)
+         ( fullDesc
+        <> progDesc "Lookup people from UMN's student/faculty database. Outputs in a human-readable format at the command line, or to CSV if called as part of a pipeline."
+        <> header "umnlookup - look up university peoples"
+         )
 
-(<||>) :: (a -> Bool) -> (a -> Bool) -> (a -> Bool)
-(<||>) = mix (||)
-infixl 7 <||>
+data Lookup = Lookup
+  { campus :: Campus
+  , role   :: Role
+  , x500   :: Bool
+  , search :: String
+  }
+  deriving (Eq, Show)
+
+lookupCLI :: Parser Lookup
+lookupCLI =
+  Lookup
+  <$> option verifyCampus
+       ( long "campus"
+      <> short 'c'
+      <> metavar "CAMPUS"
+      <> value AnyCampus
+      <> help "Restrict search to a specific campus. Choices: any, crookston, duluth, morris, rochester, twincities, other. Default: any"
+       )
+  <*> option verifyRole
+       ( long "role"
+      <> short 'r'
+      <> metavar "ROLE"
+      <> value AnyRole
+      <> help "Restrict search to certain kinds of University people. Choices: any, staff, student, alumni, retired. Default: any"
+       )
+  <*> switch
+       ( long "id-only"
+      <> short 'i'
+      <> help "Search only by x500. Default is to search as if the search term could be either a name or an x500."
+       )
+  <*> argument str (metavar "NAME/X500")
+
+-- | Each Lookup maps to a URL which we request in order to get the actual people.
+lookupURL :: Lookup -> String
+lookupURL lookup =
+  "http://myaccount.umn.edu/lookup?SET_INSTITUTION=&" ++ vars lookup
+  where vars (Lookup campus role x500 search) =
+          let baseVars = zip ["campus", "role", "CN"]
+                             [toParamString campus, toParamString role, search]
+          in urlEncodeVars $ ("type", if x500 then "Internet ID" else "name") : baseVars
+
+data Campus
+  = AnyCampus
+  | Crookston
+  | Duluth
+  | Morris
+  | Rochester
+  | TwinCities
+  | OtherCampus
+  deriving (Eq, Show)
+
+data Role
+  = AnyRole
+  | Staff
+  | Student
+  | Alumni
+  | Retired
+  deriving (Eq, Show)
+
+verifyCampus :: ReadM Campus
+verifyCampus = eitherReader $ \str ->
+  case str of
+    "any"        -> Right AnyCampus
+    "crookston"  -> Right Crookston
+    "duluth"     -> Right Duluth
+    "morris"     -> Right Morris
+    "rochester"  -> Right Rochester
+    "twincities" -> Right TwinCities
+    "other"      -> Right OtherCampus
+    _otherwise   -> Left $ printf "invalid campus name: %s" str
+
+verifyRole :: ReadM Role
+verifyRole = eitherReader $ \str ->
+  case str of
+    "any"      -> Right AnyRole
+    "staff"    -> Right Staff
+    "student"  -> Right Student
+    "alumni"   -> Right Alumni
+    "retired"  -> Right Retired
+    _otherwise -> Left $ printf "invalid role: %s" str
+
+class HTMLParam param where
+  toParamString :: param -> String
+
+instance HTMLParam Campus where
+  toParamString AnyCampus   = "a"
+  toParamString Crookston   = "c"
+  toParamString Duluth      = "d"
+  toParamString Morris      = "m"
+  toParamString Rochester   = "r"
+  toParamString TwinCities  = "t"
+  toParamString OtherCampus = "o"
+
+instance HTMLParam Role where
+  toParamString AnyRole = "any"
+  toParamString Staff   = "sta"
+  toParamString Student = "stu"
+  toParamString Alumni  = "alu"
+  toParamString Retired = "ret"
+
+
+-- Parsing our HTML into a list of people.
+
+umnLookup :: Monad m => ParsecT [Tag String] u m LookupResult
+umnLookup =
+      try singlePersonLookup
+  <|> try multiPersonLookup
+  <|> try errorLookup
+
+type LookupResult = Either String [Person]
+
+errorLookup :: Monad m => ParsecT [Tag String] u m LookupResult
+errorLookup = do
+  error <- innerText <$> balancedTags "b"
+  return $ Left (strip error)
 
 deassoc :: Eq a => a -> [(a, b)] -> ([(a, b)], Maybe b)
 deassoc k l =
   let (l', l'') = partition ((/= k) . fst) l
   in (l', lookup k l'')
 
--- UMN-specific stuff.
+singlePersonLookup :: Monad m => ParsecT [Tag String] u m LookupResult
+singlePersonLookup = do
+  optional $ tagOpen "img" >> tagOpen "br"
+  name <- innerText <$> balancedTags "h2"
+  fields <- tableFields
+  let (fields', email) = deassoc "Email Address" fields
+  case email of
+    Nothing -> fail "no email found"
+    Just e  -> return $ Right [Person name e fields']
+  where tableFields = do
+          tagOpen "table"
+          fields <- many1 tableField
+          tagClose "table"
+          return fields
 
-directoryURL :: String
-directoryURL = "http://myaccount.umn.edu/lookup?"
+        tableField = do
+          tagOpen "tr"
+          fieldName <- (replace ":" "") <$> innerText <$> balancedTags "th"
+          fieldValue <- strip <$> innerText <$> balancedTags "td"
+          tagClose "tr"
+          return (fieldName, fieldValue)
 
-directoryEnd :: Tag String -> Bool
-directoryEnd = fmap not $ (~== "<b>") <||> (~== "<p>") <||> (~== "<hr>")
+multiPersonLookup :: Monad m => ParsecT [Tag String] u m LookupResult
+multiPersonLookup = do
+  tagOpen "table"
+  fieldNames <- fieldNames
+  people <- many1 fieldValues
+  tagClose "table"
+  case generatePeople fieldNames people of
+    Nothing     -> fail "not a properly-formatted multi-result page (maybe the layout changed?)"
+    Just people -> return $ Right people
+  where fieldNames = do
+          tagOpen "tr"
+          f <- many1 $ (try $ strip <$> innerText <$> balancedTags "th")
+          tagClose "tr"
+          return f
 
-data URLArgs =
-  URLArgs { searchTerm :: String,
-            campus :: String,
-            role :: String }
-  deriving (Show, Eq)
+        fieldValues = do
+          tagOpen "tr"
+          f <- many1 $ (try $  strip
+                           <$> (replace "\xA0" " ")
+                           <$> innerText
+                           <$> balancedTags "td")
+          tagClose "tr"
+          return f
 
-defaultArgs :: URLArgs
-defaultArgs = URLArgs { searchTerm = "", campus = "any", role = "any" }
+        generatePeople fieldNames people = mapM (generatePerson fieldNames) people
 
-main :: IO ()
-main = getArgs >>= parseArgs >>= perform
+        generatePerson fieldNames person =
+          let fields = zip fieldNames person
+              (fields', name) = deassoc "Name" fields
+              (fields'', email) = deassoc "Email" fields'
+          in case (name, email) of
+               (Just n, Just e) -> Just $ Person (normalize n) e fields''
+               _other           -> Nothing
+               where normalize n = subRegex (mkRegex "(.+?), (.+?)") n "\\2 \\1"
 
-data Action = Usage
-            | Lookup String
-            | Invalid [(String, String)]
-  deriving (Show)
+
+-- Printing the people we've found to the terminal.
 
-(+/+) :: String -> String -> String
-(+/+) = (++) <$> (++ "\n")
+defaultWindow :: Integral a => Window a
+defaultWindow = Window 24 80
 
-perform :: Action -> IO ()
-perform Usage =
-  putStrLn $
-  "usage: umnlookup [(--help|-h)] [OPTIONS] <NAME/X500>" +/+
-  "" +/+
-  "    options:" +/+
-  "      --campus, -c <CAMPUS>    restrict search to certain campus" +/+
-  "          choices: any, crookston, duluth, morris, rochester, twincities, other" +/+
-  "      --role, -r <ROLE>        restrict search to certain kinds of university people" +/+
-  "          choices: any, staff, student, alumni, retired"
-perform (Lookup url) = urlSlurp url >>= directoryTags >>= parsePeople >>= printPeople
-perform (Invalid invalids) =
-  foldl (>>) (return ()) ((putStrLn . invalidMsg) <$> invalids)
-    where invalidMsg (flag, val) = "Invalid value for " ++ flag ++ ": `" ++ val ++ "'"
+-- | Produce an IO which calls the first IO if connected to a TTY, and
+--   the second IO otherwise.
+stdoutIO :: (Window Int -> IO a) -> IO a -> IO a
+stdoutIO f noTTY = do
+  isTTY <- hIsTerminalDevice stdout
+  if isTTY
+    then (maybe defaultWindow id) <$> size >>= f
+    else noTTY
 
-data Person = Person { name :: String,
-                       email :: String,
-                       fields :: [(String, String)] }
-  deriving (Show, Eq)
+data Person = Person
+  { name   :: String
+  , email  :: String
+  , fields :: [(String, String)]
+  }
 
-directoryTags :: String -> IO [Tag String]
-directoryTags = return
-  . takeWhile (not <$> isEnd)
-  . drop 4
-  . dropWhile (not <$> isTagCloseName "form")
-  . canonicalizeTags
-  . parseTags
-  where isEnd = (~== "<b>") <||> (~== "<p>") <||> (~== "<hr>")
+putLn :: IO ()
+putLn = putStrLn ""
 
-parsePeople :: [Tag String] -> IO [Person]
-parsePeople tags =
-  case scrape singleName tags of
-    Just name ->
-      let (Just fields) = scrape singleFields tags
-          (fields', Just email) = deassoc "Email Address" fields
-      in return [Person { name = name, email = email, fields = fields' }]
-    Nothing ->
-      case scrape multiFieldNames tags of
-        Just fields ->
-          let (Just fvals) = scrape multiFields tags
-          in return $ fmap (extractInfo . zip fields) fvals
-        Nothing -> return []
-        
-      where extractInfo :: [(String, String)] -> Person
-            extractInfo f =
-              let (f', Just email) = deassoc "Email" f
-                  (f'', Just name) = deassoc "Name" f'
-              in Person { name = name, email = email, fields = f'' }
+printPeopleTTY :: [Person] -> Window Int -> IO ()
+printPeopleTTY people window =
+  sequence_ $ intersperse (printf "\n* * * * *\n\n")
+                          (fmap (printPersonTTY window) people)
 
-  where singleName = text "h2"
-        singleFields = chroots "tr" (do
-          key <- text "th"
-          val <- text "td"
-          return (strip key, strip val))
+filterMaybes :: [Maybe a] -> [a]
+filterMaybes = fmap (maybe undefined id)
+               . (filter $ \obj -> case obj of { Nothing -> False; Just _x  -> True} )
 
-        multiFieldNames = chroot ("tr" @: ["align" @= "CENTER"]) (fmap strip <$> texts "th")
-        multiFields = chroots ("tr" @: ["align" @= "LEFT"]) (fmap strip <$> texts "td")
+printPersonTTY :: Window Int -> Person -> IO ()
+printPersonTTY window (Person name email fields) = do
+  putStrLn name
+  putStrLn email
+  putLn
+  sequence_ $ intersperse putLn (filterMaybes (fmap (printFieldTTY window) fields))
 
-        strip = unpack . dropAround (isSpace <||> (== ':') <||> isControl) . pack
+printFieldTTY :: Window Int -> (String, String) -> Maybe (IO ())
+printFieldTTY _window (fieldName, value) =
+  if null value
+    then Nothing
+    else Just $ do printf "### %s ###\n" fieldName
+                   putStrLn $ value
 
-printPeople :: [Person] -> IO ()
-printPeople people =
-  if null people
-    then return ()
-    else let output = fmap printPerson people
-         in foldl ((>>) <$> (>> putPersonDivider)) (head output) (tail output)
-            >> putStr "\n"
-  where printPerson :: Person -> IO ()
-        printPerson (Person { name = name, email = email, fields = fields }) =
-          putNameAndEmail
-          >> putFieldDivider
-          >> putFields
+printPeopleNoTTY :: [Person] -> IO ()
+printPeopleNoTTY = mapM_ printPersonNoTTY
 
-          where
-            putNameAndEmail = do
-              isTTY <- hIsTerminalDevice stdout
-              if isTTY
-                then printf "%s\t\t\t%s\n" name email
-                else putStr name
-                     >> putFieldDivider
-                     >> putStr email
-            putFieldDivider = do
-              isTTY <- hIsTerminalDevice stdout
-              if isTTY then putStr "\n" else putStr ","
-            putFields = do
-              isTTY <- hIsTerminalDevice stdout
-              if null fields
-                then return ()
-                else if isTTY
-                     then let output = fmap (\(k, v) -> printf "%s\t\t\t%s" k v) fields
-                          in foldl ((>>) <$> (>> putStr "\n")) (head output) (tail output)
-                     else let keys = fmap (putStr . fst) fields
-                              vals = fmap (putStr . snd) fields
-                          in foldl ((>>) <$> (>> putStr ";")) (head keys) (tail keys)
-                             >> putFieldDivider
-                             >> foldl ((>>) <$> (>> putStr ";")) (head vals) (tail vals)
-                             
-        putPersonDivider = do
-          isTTY <- hIsTerminalDevice stdout
-          if isTTY then putStr "\n\n" else putStr "\n"
-              
-parseArgs :: [String] -> IO Action
-parseArgs flags = parse' flags defaultArgs
-  where parse' ("--help":_) _ = return Usage
-        parse' ("-h":_) _ = return Usage
-        parse' ("--campus":campus:flags) args =
-          parse' flags (args { campus = campus })
-        parse' ("-c":campus:flags) args =
-          parse' flags (args { campus = campus })
-        parse' ("--role":role:flags) args =
-          parse' flags (args { role = role })
-        parse' ("-r":role:flags) args =
-          parse' flags (args { role = role })
-        parse' [searchTerm] args = return (validate $ args { searchTerm = searchTerm })
-        parse' _ _ = return Usage
+printPersonNoTTY :: Person -> IO ()
+printPersonNoTTY (Person name email fields) = do
+  printf "%s,%s" name email
+  putChar ','
+  printFieldNamesNoTTY $ fmap fst fields
+  putChar ','
+  printFieldValuesNoTTY $ fmap snd fields
+  putLn
 
-        validate args =
-          case (convertCampus (campus args), convertRole (role args)) of
-            (Just campus', Just role') -> Lookup $ convertToURL (args { campus = campus', role = role' })
-            (Nothing, Just _) -> Invalid [("campus", campus args)]
-            (Just _, Nothing) -> Invalid [("role", role args)]
-            (Nothing, Nothing) -> Invalid [("campus", campus args), ("role", role args)]
+printFieldNamesNoTTY :: [String] -> IO ()
+printFieldNamesNoTTY = mapM_ putStr . intersperse ";" . fmap strip
 
-        convertToURL :: URLArgs -> String
-        convertToURL (URLArgs { searchTerm = searchTerm, campus = campus, role = role }) =
-          directoryURL ++ urlEncodeVars [("CN", searchTerm), ("campus", campus), ("role", role)]
-        
-        convertCampus :: String -> Maybe String
-        convertCampus "any" = Just "a"
-        convertCampus "crookston" = Just "c"
-        convertCampus "duluth" = Just "d"
-        convertCampus "morris" = Just "m"
-        convertCampus "rochester" = Just "r"
-        convertCampus "twincites" = Just "t"
-        convertCampus "other" = Just "o"
-        convertCampus _ = Nothing
+printFieldValuesNoTTY :: [String] -> IO ()
+printFieldValuesNoTTY strs = mapM_ putStr
+                               (intersperse ";" $ fmap (escapeCSV . strip) strs)
 
-        convertRole :: String -> Maybe String
-        convertRole "any" = Just "any"
-        convertRole "staff" = Just "sta"
-        convertRole "student" = Just "stu"
-        convertRole "alumni" = Just "alu"
-        convertRole "retired" = Just "ret"
-        convertRole _ = Nothing
+escapeCSV :: String -> String
+escapeCSV = mconcat . fmap escape
+  where escape '\n' = "\\n"
+        escape ';'  = "\\;"
+        escape ','  = "\\,"
+        escape c    = [c]
